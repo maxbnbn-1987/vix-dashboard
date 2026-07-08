@@ -61,8 +61,8 @@ def build_batches(metrics):
          "hit": px <= b2_hi},
         {"name": "第3批 35%", "lo": None, "hi": b3_hi,
          "zone": f"{b3_hi:,} 以下",
-         "desc": f"跌破季線3%以上，或VIX>{VIX_B3} 的過度殺跌；否則轉右側回補",
-         "hit": px <= b3_hi or (vix is not None and vix > VIX_B3)},
+         "desc": f"跌破季線3%以上；或已深入第2批下緣後遇 VIX>{VIX_B3} 過度殺跌",
+         "hit": px <= b3_hi or (vix is not None and vix > VIX_B3 and px <= b2_lo)},
     ]
     return [(b, b["hit"]) for b in batches]
 
