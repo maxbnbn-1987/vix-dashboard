@@ -124,61 +124,85 @@ def _parse_vix_rows(rows):
     return dates, closes
 
 
+TAIFEX_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Referer": "https://www.taifex.com.tw/cht/7/vixDaily3MNew",
+    "Accept-Language": "zh-TW,zh;q=0.9",
+}
+
+
 def fetch_vixtwn():
-    """台指VIX (VIXTWN)。依序嘗試多個來源, 並印出診斷訊息到 log。"""
-    end = datetime.now(TPE)
-    start = end - timedelta(days=LOOKBACK_DAYS * 2)
+    """台指VIX (VIXTWN) v3: 從期交所「前3個月每日收盤」頁面自我發現資料連結。
 
-    # --- 候選1: 期交所 OpenAPI (JSON, 免參數) --------------------------------
+    步驟: 1) GET/POST 頁面 → 先試著直接解析表格內的 日期+數值
+          2) 解析頁面上所有含 vix / file 的連結, 逐一下載嘗試解析 CSV
+          全程印 [diag] 供 Actions log 除錯。
+    """
+    import re
+    page_url = "https://www.taifex.com.tw/cht/7/vixDaily3MNew"
+    all_rows = []
     try:
-        url = "https://openapi.taifex.com.tw/v1/VIXDailyQuotes"
-        r = requests.get(url, timeout=20, headers={"accept": "application/json"})
-        print(f"[diag] OpenAPI VIXDailyQuotes -> HTTP {r.status_code}, 前120字: {r.text[:120]!r}", file=sys.stderr)
-        if r.ok:
-            data = r.json()
-            if isinstance(data, list) and data:
-                print(f"[diag] OpenAPI 首筆欄位: {list(data[0].keys())}", file=sys.stderr)
-                rows = []
-                for it in data:
-                    ds = it.get("Date") or it.get("date") or it.get("交易日期") or ""
-                    val = (it.get("VIX") or it.get("vix") or it.get("ClosingIndex")
-                           or it.get("收盤指數") or it.get("Close") or "")
-                    rows.append((str(ds), val))
-                out = _parse_vix_rows(rows)
-                if out[0]:
-                    print(f"[ok] VIXTWN 來源=OpenAPI, {len(out[0])}筆", file=sys.stderr)
-                    return out
-    except Exception as e:
-        print(f"[warn] OpenAPI 候選失敗: {e}", file=sys.stderr)
-
-    # --- 候選2: 期交所網站 CSV 下載 ------------------------------------------
-    for url, payload in [
-        ("https://www.taifex.com.tw/cht/7/vixQuotesDown",
-         {"down_type": "1", "queryStartDate": start.strftime("%Y/%m/%d"),
-          "queryEndDate": end.strftime("%Y/%m/%d")}),
-        ("https://www.taifex.com.tw/cht/7/vixMinNewDown",
-         {"down_type": "1", "queryStartDate": start.strftime("%Y/%m/%d"),
-          "queryEndDate": end.strftime("%Y/%m/%d")}),
-    ]:
-        try:
-            r = requests.post(url, data=payload, timeout=20)
-            head = r.content[:150].decode("big5", errors="ignore")
-            print(f"[diag] {url.rsplit('/',1)[-1]} -> HTTP {r.status_code}, "
-                  f"Content-Type: {r.headers.get('Content-Type')}, 前150字: {head!r}", file=sys.stderr)
-            if not r.ok or "<html" in head.lower():
-                continue
-            text = r.content.decode("big5", errors="ignore")
-            rows = []
-            for line in text.splitlines()[1:]:
-                parts = [p.strip().strip('"') for p in line.split(",")]
-                if len(parts) >= 2:
-                    rows.append((parts[0], parts[-1]))
-            out = _parse_vix_rows(rows)
+        html = ""
+        for method in ("GET", "POST"):
+            r = (requests.get(page_url, headers=TAIFEX_HEADERS, timeout=25) if method == "GET"
+                 else requests.post(page_url, headers=TAIFEX_HEADERS, data={}, timeout=25))
+            print(f"[diag] {method} vixDaily3MNew -> HTTP {r.status_code}, {len(r.text)} chars", file=sys.stderr)
+            if r.ok and len(r.text) > 1000:
+                html = r.text
+                # 1) 直接解析頁面表格: <td>YYYY/MM/DD</td><td>數值</td>
+                rows = re.findall(
+                    r">(\d{4}/\d{2}/\d{2})<[^>]*>\s*(?:</td>\s*<td[^>]*>)?\s*([0-9]+\.[0-9]+)<",
+                    html.replace("\n", " "))
+                print(f"[diag] {method} 頁內表格解析到 {len(rows)} 筆", file=sys.stderr)
+                all_rows.extend(rows)
+                if len(all_rows) >= 40:
+                    break
+        if len(all_rows) >= 40:
+            out = _parse_vix_rows(all_rows)
             if out[0]:
-                print(f"[ok] VIXTWN 來源={url}, {len(out[0])}筆", file=sys.stderr)
+                print(f"[ok] VIXTWN 來源=頁內表格, {len(out[0])}筆", file=sys.stderr)
                 return out
-        except Exception as e:
-            print(f"[warn] {url} 失敗: {e}", file=sys.stderr)
+
+        # 2) 從頁面找出所有可能的資料檔連結
+        links = re.findall(r'href="([^"]+)"', html, flags=re.I)
+        cands = []
+        for lk in links:
+            low = lk.lower()
+            if ("vix" in low or "/file/" in low) and not low.startswith("javascript"):
+                if low.endswith((".css", ".js", ".png", ".jpg", ".gif", ".pdf")):
+                    continue
+                if lk.startswith("/"):
+                    lk = "https://www.taifex.com.tw" + lk
+                if lk.startswith("http") and lk not in cands:
+                    cands.append(lk)
+        print(f"[diag] 頁面候選連結 {len(cands)} 個:", file=sys.stderr)
+        for c in cands[:15]:
+            print(f"[diag]   {c}", file=sys.stderr)
+
+        for lk in cands[:15]:
+            if "/cht/7/vix" in lk and lk.rstrip("/").endswith(("vixMinNew", "vixMin3MNew", "vixQA", "vixDaily3MNew")):
+                continue  # 導覽頁, 跳過
+            try:
+                r = requests.get(lk, headers=TAIFEX_HEADERS, timeout=25)
+                body = r.content.decode("big5", errors="ignore")
+                if "<html" in body[:300].lower():
+                    body = r.content.decode("utf-8", errors="ignore")
+                    if "<html" in body[:300].lower():
+                        continue
+                rows = []
+                for line in body.splitlines():
+                    parts = [p.strip().strip('"') for p in line.replace("\t", ",").split(",")]
+                    if len(parts) >= 2:
+                        rows.append((parts[0], parts[-1]))
+                out = _parse_vix_rows(rows)
+                if out[0] and len(out[0]) >= 15:
+                    print(f"[ok] VIXTWN 來源={lk}, {len(out[0])}筆", file=sys.stderr)
+                    return out
+            except Exception as e:
+                print(f"[warn] 候選 {lk} 失敗: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"[warn] vixDaily3MNew 抓取失敗: {e}", file=sys.stderr)
 
     print("[warn] VIXTWN 全部候選來源失敗, 卡片將顯示資料源失敗", file=sys.stderr)
     return None, None
