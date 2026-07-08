@@ -2,7 +2,7 @@
 """
 台美波動率作戰儀表板 market_dashboard.py
 ========================================
-抓取:  ^VIX / ^IXIC(那斯達克) / ^SOX(費半) / ^TWII(加權) / VIXTWN(台指VIX)
+抓取:  ^VIX / ^IXIC(那斯達克) / ^SOX(費半) / ^TWII(加權)
 計算:  MA5 / MA20 / MA60、乖離率、三批進場觸發條件
 輸出:  docs/index.html (自包含單頁, 適合 GitHub Pages) + 可選 Telegram 推播
 
@@ -26,13 +26,13 @@ TPE = timezone(timedelta(hours=8))
 
 # ---------------------------------------------------------------- 三批進場參數（動態）
 # 點位不寫死：每次執行用「波段高點(近120日收盤高)」與「當日季線MA60」重算
-#   第1批 = 高點回檔 7.5%–8.5%，或 台指VIX > 25
+#   第1批 = 高點回檔 7.5%–8.5%，或 美股VIX > 28（台指VIX 無穩定免費源, 以美股VIX 代理恐慌）
 #   第2批 = 季線 MA60 ±1%（季線上移, 區間自動跟著上移 → 涵蓋以盤代跌劇本）
 #   第3批 = 跌破季線 3% 以上，或 VIX > 40
 B1_PULLBACK = (0.915, 0.925)   # 高點 × 此區間
 B2_BAND = 0.01                 # 季線 ±1%
 B3_BELOW_MA = 0.97             # 季線 × 0.97 以下
-TVIX_B1, VIX_B3 = 25, 40
+VIX_B1, VIX_B3 = 28, 40        # 美股VIX: 第1批警戒門檻 / 第3批極端門檻
 
 
 def build_batches(metrics):
@@ -43,7 +43,6 @@ def build_batches(metrics):
     px = tw["close"]
     hi = tw["hi120"]
     ma60 = tw["ma60"] or px
-    tvix = metrics["VIXTWN"]["close"]
     vix = metrics["VIX"]["close"]
 
     b1_lo, b1_hi = round(hi * B1_PULLBACK[0]), round(hi * B1_PULLBACK[1])
@@ -53,8 +52,8 @@ def build_batches(metrics):
     batches = [
         {"name": "第1批 20-25%", "lo": b1_lo, "hi": b1_hi,
          "zone": f"{b1_lo:,} – {b1_hi:,}",
-         "desc": f"波段高點 {hi:,.0f} 回檔7.5–8.5%，或台指VIX>{TVIX_B1}",
-         "hit": px <= b1_hi or (tvix is not None and tvix > TVIX_B1)},
+         "desc": f"波段高點 {hi:,.0f} 回檔7.5–8.5%，或美股VIX>{VIX_B1}",
+         "hit": px <= b1_hi or (vix is not None and vix > VIX_B1)},
         {"name": "第2批 40%（最重）", "lo": b2_lo, "hi": b2_hi,
          "zone": f"{b2_lo:,} – {b2_hi:,}",
          "desc": f"季線 MA60 {ma60:,.0f} ±1%（每日重算, 自動上移）",
@@ -68,7 +67,6 @@ def build_batches(metrics):
 
 SYMBOLS = {
     "VIX":    {"yf": "^VIX",  "label": "VIX 恐慌指數",   "kind": "vol",   "zones": [(0, 20, "平靜"), (20, 28, "警戒"), (28, 40, "恐慌"), (40, 999, "極端")]},
-    "VIXTWN": {"yf": None,    "label": "台指VIX",        "kind": "vol",   "zones": [(0, 25, "平靜"), (25, 30, "警戒"), (30, 40, "恐慌"), (40, 999, "極端")]},
     "IXIC":   {"yf": "^IXIC", "label": "那斯達克",        "kind": "price"},
     "SOX":    {"yf": "^SOX",  "label": "費城半導體",      "kind": "price"},
     "TWII":   {"yf": "^TWII", "label": "台灣加權指數",    "kind": "price"},
@@ -124,48 +122,6 @@ def _parse_vix_rows(rows):
     return dates, closes
 
 
-def fetch_vixtwn():
-    """台指VIX (VIXTWN) — 走 FinMind API 的 TaiwanOptionVix dataset。
-    這是 tw-invest 既有資料源, 最穩定; token 從環境變數 FINMIND_TOKEN 讀取(可留空,限額較低)。
-    """
-    end = datetime.now(TPE)
-    start = end - timedelta(days=LOOKBACK_DAYS * 3)
-    url = "https://api.finmindtrade.com/api/v4/data"
-    params = {
-        "dataset": "TaiwanOptionVix",
-        "start_date": start.strftime("%Y-%m-%d"),
-        "end_date": end.strftime("%Y-%m-%d"),
-    }
-    headers = {}
-    token = os.getenv("FINMIND_TOKEN", "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=25)
-        print(f"[diag] FinMind TaiwanOptionVix -> HTTP {r.status_code}", file=sys.stderr)
-        r.raise_for_status()
-        payload = r.json()
-        if payload.get("status") not in (200, None):
-            print(f"[warn] FinMind msg: {payload.get('msg')}", file=sys.stderr)
-        data = payload.get("data", [])
-        if not data:
-            print("[warn] FinMind TaiwanOptionVix 回傳空資料 (可能超出免費額度或無 token)", file=sys.stderr)
-            return None, None
-        # 欄位通常為 date + vix (或含 option_name); 動態抓取數值欄
-        rows = []
-        for it in data:
-            ds = it.get("date") or ""
-            val = it.get("vix", it.get("value", it.get("TaiwanOptionVix", "")))
-            rows.append((str(ds), val))
-        out = _parse_vix_rows(rows)
-        if out[0]:
-            print(f"[ok] VIXTWN 來源=FinMind, {len(out[0])}筆", file=sys.stderr)
-            return out
-        print(f"[warn] FinMind 資料解析失敗, 首筆欄位: {list(data[0].keys())}", file=sys.stderr)
-        return None, None
-    except Exception as e:
-        print(f"[warn] FinMind TaiwanOptionVix 失敗: {e}", file=sys.stderr)
-        return None, None
 def mock_series(base, drift, vol, n=LOOKBACK_DAYS, seed=1):
     import random
     random.seed(seed)
@@ -257,7 +213,7 @@ def render_html(metrics, batches_state, ts):
     """
 
     cards = ""
-    for key in ["TWII", "IXIC", "SOX", "VIX", "VIXTWN"]:
+    for key in ["TWII", "IXIC", "SOX", "VIX"]:
         m = metrics[key]
         up = (m["chg"] or 0) >= 0
         cls = "up" if up else "dn"   # 台灣慣例: 紅漲綠跌
@@ -355,7 +311,7 @@ footer{{margin-top:16px;color:var(--dim);font-size:10.5px;line-height:1.6}}
   </div>
 </section>
 <footer>紅漲綠跌（台灣慣例）。均線為日收盤簡單移動平均；季線每日重算，勿用固定點位。
-波動率分區 — VIX：20警戒 / 28恐慌 / 40極端；台指VIX：25 / 30 / 40。
+波動率分區 — 美股VIX：20警戒 / 28恐慌 / 40極端（作為台股恐慌代理）。
 資料源：Yahoo Finance、臺灣期貨交易所。本頁為個人監控工具，非投資建議。</footer>
 </body></html>"""
 
@@ -367,7 +323,7 @@ def push_telegram(metrics, batches_state, ts):
         print("[warn] 未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID, 略過推播", file=sys.stderr)
         return
     lines = [f"📟 波動作戰盤 {ts}"]
-    for k in ["TWII", "IXIC", "SOX", "VIX", "VIXTWN"]:
+    for k in ["TWII", "IXIC", "SOX", "VIX"]:
         m = metrics[k]
         if not m["ok"]:
             lines.append(f"{m['label']}: 資料源失敗")
@@ -395,7 +351,6 @@ def main():
     raw = {}
     if args.mock:
         raw["VIX"] = mock_series(17, 0.004, 0.05, seed=3)
-        raw["VIXTWN"] = mock_series(21, 0.005, 0.05, seed=4)
         raw["IXIC"] = mock_series(21500, 0.0018, 0.012, seed=5)
         raw["SOX"] = mock_series(6900, 0.002, 0.02, seed=6)
         raw["TWII"] = mock_series(41000, 0.002, 0.011, seed=7)
