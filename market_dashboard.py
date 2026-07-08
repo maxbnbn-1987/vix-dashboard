@@ -99,43 +99,89 @@ def fetch_yf(symbol: str):
         return None, None
 
 
-def fetch_vixtwn():
-    """台指VIX (VIXTWN)。主來源: 期交所日資料下載; 失敗回 (None, None)。
+def _parse_vix_rows(rows):
+    """rows: iterable of (date_str, value)。回傳 (dates, closes) 或 (None, None)。"""
+    dates, closes = [], []
+    for ds, v in rows:
+        for f in ("%Y/%m/%d", "%Y-%m-%d"):
+            try:
+                d = datetime.strptime(ds.strip(), f).strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                d = None
+        if d is None:
+            continue
+        try:
+            closes.append(float(str(v).replace(",", "").strip()))
+            dates.append(d)
+        except ValueError:
+            continue
+    if not closes:
+        return None, None
+    pairs = sorted(zip(dates, closes))
+    dates = [p[0] for p in pairs][-LOOKBACK_DAYS:]
+    closes = [p[1] for p in pairs][-LOOKBACK_DAYS:]
+    return dates, closes
 
-    !! 期交所端點/參數偶有調整, 若失敗請到
-       https://www.taifex.com.tw/cht/7/vixMinNew 確認最新下載格式,
-       或改接你 FinMind PAT 能拿到的等價資料源。儀表板對缺資料有降級顯示。
-    """
-    url = "https://www.taifex.com.tw/cht/7/vixQuotesDown"
+
+def fetch_vixtwn():
+    """台指VIX (VIXTWN)。依序嘗試多個來源, 並印出診斷訊息到 log。"""
     end = datetime.now(TPE)
     start = end - timedelta(days=LOOKBACK_DAYS * 2)
-    payload = {
-        "down_type": "1",
-        "queryStartDate": start.strftime("%Y/%m/%d"),
-        "queryEndDate": end.strftime("%Y/%m/%d"),
-    }
+
+    # --- 候選1: 期交所 OpenAPI (JSON, 免參數) --------------------------------
     try:
-        r = requests.post(url, data=payload, timeout=20)
-        r.raise_for_status()
-        text = r.content.decode("big5", errors="ignore")
-        dates, closes = [], []
-        for line in text.splitlines()[1:]:
-            parts = [p.strip().strip('"') for p in line.split(",")]
-            if len(parts) < 2 or "/" not in parts[0]:
-                continue
-            try:
-                d = datetime.strptime(parts[0], "%Y/%m/%d").strftime("%Y-%m-%d")
-                v = float(parts[-1])  # 收盤 VIX 通常在末欄, 若格式異動需檢查
-            except ValueError:
-                continue
-            dates.append(d)
-            closes.append(v)
-        if not closes:
-            return None, None
-        return dates[-LOOKBACK_DAYS:], closes[-LOOKBACK_DAYS:]
+        url = "https://openapi.taifex.com.tw/v1/VIXDailyQuotes"
+        r = requests.get(url, timeout=20, headers={"accept": "application/json"})
+        print(f"[diag] OpenAPI VIXDailyQuotes -> HTTP {r.status_code}, 前120字: {r.text[:120]!r}", file=sys.stderr)
+        if r.ok:
+            data = r.json()
+            if isinstance(data, list) and data:
+                print(f"[diag] OpenAPI 首筆欄位: {list(data[0].keys())}", file=sys.stderr)
+                rows = []
+                for it in data:
+                    ds = it.get("Date") or it.get("date") or it.get("交易日期") or ""
+                    val = (it.get("VIX") or it.get("vix") or it.get("ClosingIndex")
+                           or it.get("收盤指數") or it.get("Close") or "")
+                    rows.append((str(ds), val))
+                out = _parse_vix_rows(rows)
+                if out[0]:
+                    print(f"[ok] VIXTWN 來源=OpenAPI, {len(out[0])}筆", file=sys.stderr)
+                    return out
     except Exception as e:
-        print(f"[warn] TAIFEX VIXTWN 失敗: {e}", file=sys.stderr)
-        return None, None
+        print(f"[warn] OpenAPI 候選失敗: {e}", file=sys.stderr)
+
+    # --- 候選2: 期交所網站 CSV 下載 ------------------------------------------
+    for url, payload in [
+        ("https://www.taifex.com.tw/cht/7/vixQuotesDown",
+         {"down_type": "1", "queryStartDate": start.strftime("%Y/%m/%d"),
+          "queryEndDate": end.strftime("%Y/%m/%d")}),
+        ("https://www.taifex.com.tw/cht/7/vixMinNewDown",
+         {"down_type": "1", "queryStartDate": start.strftime("%Y/%m/%d"),
+          "queryEndDate": end.strftime("%Y/%m/%d")}),
+    ]:
+        try:
+            r = requests.post(url, data=payload, timeout=20)
+            head = r.content[:150].decode("big5", errors="ignore")
+            print(f"[diag] {url.rsplit('/',1)[-1]} -> HTTP {r.status_code}, "
+                  f"Content-Type: {r.headers.get('Content-Type')}, 前150字: {head!r}", file=sys.stderr)
+            if not r.ok or "<html" in head.lower():
+                continue
+            text = r.content.decode("big5", errors="ignore")
+            rows = []
+            for line in text.splitlines()[1:]:
+                parts = [p.strip().strip('"') for p in line.split(",")]
+                if len(parts) >= 2:
+                    rows.append((parts[0], parts[-1]))
+            out = _parse_vix_rows(rows)
+            if out[0]:
+                print(f"[ok] VIXTWN 來源={url}, {len(out[0])}筆", file=sys.stderr)
+                return out
+        except Exception as e:
+            print(f"[warn] {url} 失敗: {e}", file=sys.stderr)
+
+    print("[warn] VIXTWN 全部候選來源失敗, 卡片將顯示資料源失敗", file=sys.stderr)
+    return None, None
 
 
 def mock_series(base, drift, vol, n=LOOKBACK_DAYS, seed=1):
