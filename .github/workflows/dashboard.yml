@@ -1,0 +1,36 @@
+# .github/workflows/dashboard.yml
+# 波動作戰盤 — 盤中每10分鐘更新一次, 產出 docs/index.html 供 GitHub Pages
+name: vix-dashboard
+
+on:
+  schedule:
+    # GitHub cron 為 UTC。台股盤中 09:00–13:45 (UTC+8) = 01:00–05:45 UTC
+    - cron: "*/10 1-5 * * 1-5"
+    # 美股盤中約 21:30–04:00 (UTC+8, 夏令) = 13:30–20:00 UTC
+    - cron: "*/15 13-20 * * 1-5"
+  workflow_dispatch: {}   # 保留手動/外部觸發 (cron-job.org 打 repo dispatch 也可)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install yfinance requests
+      - name: Build dashboard
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # 觸發批次時想推 Telegram 就把下行改成 --telegram
+        run: python market_dashboard.py --out docs/index.html
+      - name: Commit & push
+        run: |
+          git config user.name "dashboard-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add docs/index.html
+          git diff --cached --quiet || git commit -m "dashboard: $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git push
