@@ -23,6 +23,7 @@ jobs:
       - run: pip install yfinance requests
       - name: Build dashboard
         env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         # 觸發批次時想推 Telegram 就把下行改成 --telegram
