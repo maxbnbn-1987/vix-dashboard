@@ -68,10 +68,12 @@ def build_batches(metrics):
     return [(b, b["hit"]) for b in batches]
 
 SYMBOLS = {
-    "VIX":    {"yf": "^VIX",  "label": "VIX 恐慌指數",   "kind": "vol",   "zones": [(0, 20, "平靜"), (20, 28, "警戒"), (28, 40, "恐慌"), (40, 999, "極端")]},
-    "IXIC":   {"yf": "^IXIC", "label": "那斯達克",        "kind": "price"},
-    "SOX":    {"yf": "^SOX",  "label": "費城半導體",      "kind": "price"},
-    "TWII":   {"yf": "^TWII", "label": "台灣加權指數",    "kind": "price"},
+    "VIX":    {"src": "yf", "yf": "^VIX",  "label": "VIX 恐慌指數",   "kind": "vol",   "zones": [(0, 20, "平靜"), (20, 28, "警戒"), (28, 40, "恐慌"), (40, 999, "極端")]},
+    "IXIC":   {"src": "yf", "yf": "^IXIC", "label": "那斯達克",        "kind": "price"},
+    "NDX":    {"src": "yf", "yf": "^NDX",  "label": "那斯達克100",     "kind": "price"},
+    "SOX":    {"src": "yf", "yf": "^SOX",  "label": "費城半導體",      "kind": "price"},
+    "TWII":   {"src": "yf", "yf": "^TWII", "label": "台灣加權指數",    "kind": "price"},
+    "TXF":    {"src": "txf", "yf": None,   "label": "台指近月",        "kind": "price"},
 }
 
 LOOKBACK_DAYS = 130   # 足夠算 MA60 並留 60 根 sparkline
@@ -99,7 +101,55 @@ def fetch_yf(symbol: str):
         return None, None
 
 
-def _parse_vix_rows(rows):
+def fetch_txf_finmind():
+    """台指近月(TX 一般盤, 近月月合約收盤) 由 FinMind 抓取。回傳 (dates, closes) 由舊到新。
+    需環境變數 FINMIND_TOKEN（沿用 tw-invest 慣例）；缺 token 或失敗回 (None, None)。"""
+    import re
+    token = os.getenv("FINMIND_TOKEN") or os.getenv("FINMIND_API_TOKEN")
+    if not token:
+        print("[warn] 未設定 FINMIND_TOKEN, 台指近月略過", file=sys.stderr)
+        return None, None
+    try:
+        end = datetime.now(TPE)
+        start = end - timedelta(days=LOOKBACK_DAYS * 2)
+        r = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={"dataset": "TaiwanFuturesDaily", "data_id": "TX",
+                    "start_date": start.strftime("%Y-%m-%d"), "token": token},
+            timeout=20)
+        rows = r.json().get("data", [])
+        if not rows:
+            return None, None
+        # 每個交易日: 取「一般盤(position)」且為 6 碼月合約(排除週選 W)的最近月份收盤
+        by_date = {}
+        for row in rows:
+            if row.get("trading_session") not in (None, "position"):
+                continue
+            cd = str(row.get("contract_date", ""))
+            if not re.fullmatch(r"\d{6}", cd):        # 只留月合約, 排除 202607W1 這種週別
+                continue
+            try:
+                close = float(row.get("close"))
+            except (TypeError, ValueError):
+                continue
+            if close <= 0:
+                continue
+            d = row["date"]
+            # 近月 = 當日最小 contract_date（到期後該合約自動消失, 前月即自動遞補）
+            if d not in by_date or cd < by_date[d][0]:
+                by_date[d] = (cd, close)
+        if not by_date:
+            return None, None
+        pairs = sorted((d, v[1]) for d, v in by_date.items())
+        dates = [p[0] for p in pairs][-LOOKBACK_DAYS:]
+        closes = [p[1] for p in pairs][-LOOKBACK_DAYS:]
+        return dates, closes
+    except Exception as e:
+        print(f"[warn] FinMind 台指近月 失敗: {e}", file=sys.stderr)
+        return None, None
+
+
+
     """rows: iterable of (date_str, value)。回傳 (dates, closes) 或 (None, None)。"""
     dates, closes = [], []
     for ds, v in rows:
@@ -145,7 +195,7 @@ def build_metric(key, dates, closes):
     cfg = SYMBOLS[key]
     if not closes:
         return {"key": key, "label": cfg["label"], "kind": cfg["kind"], "ok": False,
-                "close": None, "chg": None, "ma5": None, "ma20": None, "ma60": None,
+                "close": None, "chg": None, "chg_pt": None, "ma5": None, "ma20": None, "ma60": None,
                 "hi120": None, "bias60": None, "zone": None, "spark": [], "date": None}
     close, prev = closes[-1], (closes[-2] if len(closes) > 1 else closes[-1])
     m5, m20, m60 = ma(closes, 5), ma(closes, 20), ma(closes, 60)
@@ -153,6 +203,7 @@ def build_metric(key, dates, closes):
         "key": key, "label": cfg["label"], "kind": cfg["kind"], "ok": True,
         "date": dates[-1], "close": round(close, 2),
         "chg": round((close / prev - 1) * 100, 2),
+        "chg_pt": round(close - prev, 2),
         "ma5": m5, "ma20": m20, "ma60": m60,
         "hi120": round(max(closes[-120:]), 2),
         "bias60": round((close / m60 - 1) * 100, 2) if m60 else None,
@@ -215,7 +266,7 @@ def render_html(metrics, batches_state, ts):
     """
 
     cards = ""
-    for key in ["TWII", "IXIC", "SOX", "VIX"]:
+    for key in ["TWII", "TXF", "IXIC", "NDX", "SOX", "VIX"]:
         m = metrics[key]
         up = (m["chg"] or 0) >= 0
         cls = "up" if up else "dn"   # 台灣慣例: 紅漲綠跌
@@ -239,7 +290,7 @@ def render_html(metrics, batches_state, ts):
         cards += f"""
         <article class="card {'vol' if m['kind']=='vol' else ''}">
           <header><h2>{m['label']}</h2>{zone_badge}</header>
-          <p class="px {cls}">{fmt(m['close'])}<small>{'+' if up else ''}{fmt(m['chg'])}%</small></p>
+          <p class="px {cls}">{fmt(m['close'])}<small>{'+' if up else ''}{fmt(m['chg_pt'])}　{'+' if up else ''}{fmt(m['chg'])}%</small></p>
           {sparkline_svg(m['spark'], cls=cls)}
           {ma_row}
           <p class="sub">資料日 {m['date']}</p>
@@ -325,12 +376,13 @@ def push_telegram(metrics, batches_state, ts):
         print("[warn] 未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID, 略過推播", file=sys.stderr)
         return
     lines = [f"📟 波動作戰盤 {ts}"]
-    for k in ["TWII", "IXIC", "SOX", "VIX"]:
+    for k in ["TWII", "TXF", "IXIC", "NDX", "SOX", "VIX"]:
         m = metrics[k]
         if not m["ok"]:
             lines.append(f"{m['label']}: 資料源失敗")
             continue
-        seg = f"{m['label']} {fmt(m['close'])} ({'+' if m['chg']>=0 else ''}{m['chg']}%)"
+        sign = '+' if (m['chg'] or 0) >= 0 else ''
+        seg = f"{m['label']} {fmt(m['close'])} ({sign}{fmt(m['chg_pt'])} / {sign}{m['chg']}%)"
         if m["kind"] == "price":
             seg += f" | MA60 {fmt(m['ma60'],0)} 乖離{'+' if m['bias60']>=0 else ''}{m['bias60']}%"
         elif m["zone"]:
@@ -354,11 +406,16 @@ def main():
     if args.mock:
         raw["VIX"] = mock_series(17, 0.004, 0.05, seed=3)
         raw["IXIC"] = mock_series(21500, 0.0018, 0.012, seed=5)
+        raw["NDX"] = mock_series(24000, 0.0018, 0.012, seed=8)
         raw["SOX"] = mock_series(6900, 0.002, 0.02, seed=6)
         raw["TWII"] = mock_series(41000, 0.002, 0.011, seed=7)
+        raw["TXF"] = mock_series(40950, 0.002, 0.012, seed=9)
     else:
         for key, cfg in SYMBOLS.items():
-            raw[key] = fetch_yf(cfg["yf"]) if cfg["yf"] else fetch_vixtwn()
+            if cfg.get("src") == "txf":
+                raw[key] = fetch_txf_finmind()
+            else:
+                raw[key] = fetch_yf(cfg["yf"])
 
     metrics = {k: build_metric(k, *raw[k]) for k in SYMBOLS}
     batches_state = build_batches(metrics)
