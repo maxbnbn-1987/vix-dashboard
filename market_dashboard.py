@@ -24,12 +24,14 @@ import requests
 
 TPE = timezone(timedelta(hours=8))
 
-# ---------------------------------------------------------------- 三批進場參數（動態）
-# 點位不寫死：每次執行用「波段高點(近120日收盤高)」與「當日季線MA60」重算
-#   第1批 = 高點回檔 7.5%–8.5%，或 美股VIX > 28（台指VIX 無穩定免費源, 以美股VIX 代理恐慌）
+# ---------------------------------------------------------------- 三批進場參數
+# 第1批錨點寫死為 PEAK（真正的波段/歷史新高，含盤中高點），不再用近120日收盤 rolling max
+#   → rolling max 會漏掉盤中高點（曾抓回 47,742），故改用固定 PEAK = 48,218.87
+#   第1批 = PEAK 回檔 7%–8%，或 美股VIX > 28（台指VIX 無穩定免費源, 以美股VIX 代理恐慌）
 #   第2批 = 季線 MA60 ±1%（季線上移, 區間自動跟著上移 → 涵蓋以盤代跌劇本）
 #   第3批 = 跌破季線 3% 以上，或 VIX > 40
-B1_PULLBACK = (0.915, 0.925)   # 高點 × 此區間
+PEAK = 48218.87                # 波段高點（52週新高, 含盤中）; 若之後創新高再手動更新此值
+B1_PULLBACK = (0.92, 0.93)     # PEAK × 此區間 → 回檔 7%–8%
 B2_BAND = 0.01                 # 季線 ±1%
 B3_BELOW_MA = 0.97             # 季線 × 0.97 以下
 VIX_B1, VIX_B3 = 28, 40        # 美股VIX: 第1批警戒門檻 / 第3批極端門檻
@@ -41,7 +43,7 @@ def build_batches(metrics):
     if not tw["ok"]:
         return []
     px = tw["close"]
-    hi = tw["hi120"]
+    hi = PEAK                       # 錨定固定波段高點（含盤中高），不用 rolling max
     ma60 = tw["ma60"] or px
     vix = metrics["VIX"]["close"]
 
@@ -52,7 +54,7 @@ def build_batches(metrics):
     batches = [
         {"name": "第1批 20-25%", "lo": b1_lo, "hi": b1_hi,
          "zone": f"{b1_lo:,} – {b1_hi:,}",
-         "desc": f"波段高點 {hi:,.0f} 回檔7.5–8.5%，或美股VIX>{VIX_B1}",
+         "desc": f"波段高點 {hi:,.0f} 回檔7–8%，或美股VIX>{VIX_B1}",
          "hit": px <= b1_hi or (vix is not None and vix > VIX_B1)},
         {"name": "第2批 40%（最重）", "lo": b2_lo, "hi": b2_hi,
          "zone": f"{b2_lo:,} – {b2_hi:,}",
@@ -188,7 +190,7 @@ def fmt(v, nd=2):
 def render_html(metrics, batches_state, ts):
     twii = metrics["TWII"]
     ma60 = twii["ma60"] or (twii["close"] or 0)
-    hi120 = twii["hi120"] or (twii["close"] or 0)
+    hi120 = PEAK                    # 圖上「波段高點」標記與階梯頂部改用固定 PEAK
     batches = [b for b, _ in batches_state]
 
     # 價格梯上下界: 動態涵蓋 高點+緩衝 到 第3批下緣-緩衝
