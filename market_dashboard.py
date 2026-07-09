@@ -73,7 +73,7 @@ SYMBOLS = {
     "NDX":    {"src": "yf", "yf": "^NDX",  "label": "那斯達克100",     "kind": "price"},
     "SOX":    {"src": "yf", "yf": "^SOX",  "label": "費城半導體",      "kind": "price"},
     "TWII":   {"src": "yf", "yf": "^TWII", "label": "台灣加權指數",    "kind": "price"},
-    "TXF":    {"src": "txf", "yf": None,   "label": "台指近月",        "kind": "price"},
+    "TXF":    {"src": "txf", "yf": None,   "label": "台指近月(含夜盤)",  "kind": "price"},
 }
 
 LOOKBACK_DAYS = 130   # 足夠算 MA60 並留 60 根 sparkline
@@ -102,9 +102,12 @@ def fetch_yf(symbol: str):
 
 
 def fetch_txf_finmind():
-    """台指近月(TX 一般盤, 近月月合約收盤) 由 FinMind 抓取。回傳 (dates, closes) 由舊到新。
+    """台指近月(TX, 近月月合約, 含夜盤) 由 FinMind 抓取。回傳 (dates, closes) 由舊到新。
+    每個交易日優先取「盤後/夜盤(after_market)」收盤, 無夜盤才退回一般盤(position);
+    夜盤反映美股隔夜走勢, 故頭條為含夜盤最新價。
     需環境變數 FINMIND_TOKEN（沿用 tw-invest 慣例）；缺 token 或失敗回 (None, None)。"""
     import re
+    from collections import defaultdict
     token = os.getenv("FINMIND_TOKEN") or os.getenv("FINMIND_API_TOKEN")
     if not token:
         print("[warn] 未設定 FINMIND_TOKEN, 台指近月略過", file=sys.stderr)
@@ -120,13 +123,11 @@ def fetch_txf_finmind():
         rows = r.json().get("data", [])
         if not rows:
             return None, None
-        # 每個交易日: 取「一般盤(position)」且為 6 碼月合約(排除週選 W)的最近月份收盤
-        by_date = {}
+        # 依日期收集 (contract_date, session, close), 只留 6 碼月合約(排除週選 W)
+        day_rows = defaultdict(list)
         for row in rows:
-            if row.get("trading_session") not in (None, "position"):
-                continue
             cd = str(row.get("contract_date", ""))
-            if not re.fullmatch(r"\d{6}", cd):        # 只留月合約, 排除 202607W1 這種週別
+            if not re.fullmatch(r"\d{6}", cd):
                 continue
             try:
                 close = float(row.get("close"))
@@ -134,13 +135,17 @@ def fetch_txf_finmind():
                 continue
             if close <= 0:
                 continue
-            d = row["date"]
-            # 近月 = 當日最小 contract_date（到期後該合約自動消失, 前月即自動遞補）
-            if d not in by_date or cd < by_date[d][0]:
-                by_date[d] = (cd, close)
+            day_rows[row["date"]].append((cd, row.get("trading_session"), close))
+        by_date = {}
+        for d, items in day_rows.items():
+            near = min(c for c, _, _ in items)          # 近月 = 當日最小 contract_date
+            near_items = [(s, c2) for c, s, c2 in items if c == near]
+            # 優先夜盤(after_market)當最新價, 否則退回一般盤
+            night = next((c2 for s, c2 in near_items if s == "after_market"), None)
+            by_date[d] = night if night is not None else near_items[0][1]
         if not by_date:
             return None, None
-        pairs = sorted((d, v[1]) for d, v in by_date.items())
+        pairs = sorted(by_date.items())
         dates = [p[0] for p in pairs][-LOOKBACK_DAYS:]
         closes = [p[1] for p in pairs][-LOOKBACK_DAYS:]
         return dates, closes
